@@ -467,10 +467,28 @@ def main():
     # Resolve train split name: if the default "train+validation" is used but
     # "validation" doesn't exist, fall back to "train" only.
     train_split_name = data_args.train_split_name
-    if available_splits is not None and "+" in train_split_name:
+    if "+" in train_split_name:
         requested_splits = [s.strip() for s in train_split_name.split("+")]
-        valid_splits = [s for s in requested_splits if s in available_splits]
-        missing_splits = [s for s in requested_splits if s not in available_splits]
+        if available_splits is not None:
+            valid_splits = [s for s in requested_splits if s in available_splits]
+            missing_splits = [s for s in requested_splits if s not in available_splits]
+        else:
+            # available_splits detection failed; probe each split individually
+            valid_splits = []
+            missing_splits = []
+            for s in requested_splits:
+                try:
+                    load_dataset(
+                        data_args.dataset_name,
+                        data_args.dataset_config_name,
+                        split=s,
+                        token=data_args.token,
+                        trust_remote_code=data_args.trust_remote_code,
+                        streaming=True,
+                    )
+                    valid_splits.append(s)
+                except Exception:
+                    missing_splits.append(s)
         if missing_splits:
             logger.warning(
                 f"Requested train splits {missing_splits} not found in dataset. "

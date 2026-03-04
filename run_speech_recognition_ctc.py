@@ -868,7 +868,10 @@ def main():
     if training_args.push_to_hub:
         trainer.push_to_hub(**kwargs)
     else:
-        trainer.create_model_card(**kwargs)
+        try:
+            trainer.create_model_card(**kwargs)
+        except Exception as e:
+            logger.warning(f"Could not create model card: {e}. Skipping model card creation.")
 
     return results
 

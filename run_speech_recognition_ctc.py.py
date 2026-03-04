@@ -450,11 +450,58 @@ def main():
     # 1. First, let's load the dataset
     raw_datasets = DatasetDict()
 
+    # Detect available splits in the dataset
+    from datasets import get_dataset_split_names
+
+    try:
+        available_splits = get_dataset_split_names(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            trust_remote_code=data_args.trust_remote_code,
+        )
+        logger.info(f"Available splits for dataset '{data_args.dataset_name}': {available_splits}")
+    except Exception as e:
+        logger.warning(f"Could not detect available splits: {e}. Will proceed with provided split names.")
+        available_splits = None
+
+    # Resolve train split name: if the default "train+validation" is used but
+    # "validation" doesn't exist, fall back to "train" only.
+    train_split_name = data_args.train_split_name
+    if available_splits is not None and "+" in train_split_name:
+        requested_splits = [s.strip() for s in train_split_name.split("+")]
+        valid_splits = [s for s in requested_splits if s in available_splits]
+        missing_splits = [s for s in requested_splits if s not in available_splits]
+        if missing_splits:
+            logger.warning(
+                f"Requested train splits {missing_splits} not found in dataset. "
+                f"Available splits: {available_splits}. "
+                f"Falling back to: {'+'.join(valid_splits) if valid_splits else 'train'}"
+            )
+        train_split_name = "+".join(valid_splits) if valid_splits else "train"
+
+    # Resolve eval split name: fall back through "test" -> "validation" -> first non-train split
+    eval_split_name = data_args.eval_split_name
+    if available_splits is not None and eval_split_name not in available_splits:
+        fallback_eval = None
+        for candidate in ["test", "validation"]:
+            if candidate in available_splits:
+                fallback_eval = candidate
+                break
+        if fallback_eval is None:
+            # Use the first split that isn't "train"
+            non_train = [s for s in available_splits if s != "train"]
+            fallback_eval = non_train[0] if non_train else "train"
+        logger.warning(
+            f"Eval split '{eval_split_name}' not found. "
+            f"Available splits: {available_splits}. Falling back to '{fallback_eval}'."
+        )
+        eval_split_name = fallback_eval
+
     if training_args.do_train:
         raw_datasets["train"] = load_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
-            split=data_args.train_split_name,
+            split=train_split_name,
             token=data_args.token,
             trust_remote_code=data_args.trust_remote_code,
         )
@@ -480,7 +527,7 @@ def main():
         raw_datasets["eval"] = load_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
-            split=data_args.eval_split_name,
+            split=eval_split_name,
             token=data_args.token,
             trust_remote_code=data_args.trust_remote_code,
         )

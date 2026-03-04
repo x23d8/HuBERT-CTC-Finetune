@@ -644,7 +644,7 @@ def main():
         tokenizer_name_or_path,
         token=data_args.token,
         trust_remote_code=data_args.trust_remote_code,
-        **tokenizer_kwargs,
+        **tokenizer_kwargs, 
     )
     feature_extractor = AutoFeatureExtractor.from_pretrained(
         model_args.model_name_or_path,

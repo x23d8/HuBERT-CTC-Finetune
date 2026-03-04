@@ -682,6 +682,7 @@ def main():
         config=config,
         token=data_args.token,
         trust_remote_code=data_args.trust_remote_code,
+        ignore_mismatched_sizes=True,
     )
 
     # freeze encoder

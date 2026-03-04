@@ -126,29 +126,46 @@ def main():
     model = model.eval().to(device)
     print(f"Model loaded. Hidden size: {model.config.hidden_size}")
 
-    # ── Load dataset ──────────────────────────────────────────────────
+    # ── Load dataset (streaming mode — downloads only the requested split) ──
     print(f"Loading dataset: {args.dataset_name} (config={args.dataset_config}, split={args.split})")
+    print("Using STREAMING mode — data is downloaded on-the-fly, not cached entirely.")
     dataset = load_dataset(
         args.dataset_name,
         args.dataset_config,
         split=args.split,
         token=args.token,
         trust_remote_code=args.trust_remote_code,
+        streaming=True,  # only downloads data as needed, per-split
     )
 
     if args.max_samples is not None:
-        dataset = dataset.select(range(min(args.max_samples, len(dataset))))
-        print(f"Using {len(dataset)} samples (limited by --max_samples)")
+        dataset = dataset.take(args.max_samples)
+        print(f"Will extract up to {args.max_samples} samples (limited by --max_samples)")
     else:
-        print(f"Total samples: {len(dataset)}")
+        print("Will extract all samples in the split.")
 
-    # Validate columns
-    if args.audio_column not in dataset.column_names:
-        print(f"ERROR: Audio column '{args.audio_column}' not found. Available: {dataset.column_names}")
+    # Validate columns by peeking at the first sample
+    first_sample = next(iter(dataset))
+    available_columns = list(first_sample.keys())
+    if args.audio_column not in available_columns:
+        print(f"ERROR: Audio column '{args.audio_column}' not found. Available: {available_columns}")
         sys.exit(1)
-    if args.text_column not in dataset.column_names:
-        print(f"ERROR: Text column '{args.text_column}' not found. Available: {dataset.column_names}")
+    if args.text_column not in available_columns:
+        print(f"ERROR: Text column '{args.text_column}' not found. Available: {available_columns}")
         sys.exit(1)
+    print(f"Columns validated: audio='{args.audio_column}', text='{args.text_column}'")
+
+    # Re-create the stream (peeking consumed it)
+    dataset = load_dataset(
+        args.dataset_name,
+        args.dataset_config,
+        split=args.split,
+        token=args.token,
+        trust_remote_code=args.trust_remote_code,
+        streaming=True,
+    )
+    if args.max_samples is not None:
+        dataset = dataset.take(args.max_samples)
 
     # ── Prepare output directory ──────────────────────────────────────
     os.makedirs(args.output_dir, exist_ok=True)
@@ -160,7 +177,7 @@ def main():
     errors = []
 
     print("\nExtracting embeddings...")
-    for i, sample in enumerate(tqdm(dataset, desc="Extracting")):
+    for i, sample in enumerate(tqdm(dataset, desc="Extracting", total=args.max_samples)):
         try:
             audio = sample[args.audio_column]
             text = sample[args.text_column]

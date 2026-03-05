@@ -785,7 +785,7 @@ def main():
         # we do not want to group tokens when computing the metrics
         label_str = tokenizer.batch_decode(pred.label_ids, group_tokens=False)
 
-        # Log each prediction vs ground truth
+        # Log each prediiction vs ground truth
         logger.info("=" * 60)
         logger.info("EVALUATION PREDICTIONS vs GROUND TRUTH")
         logger.info("=" * 60)
@@ -904,7 +904,7 @@ def main():
         with open(all_eval_results_path, "w") as f:
             json.dump(eval_logging_callback.all_eval_results, f, indent=2)
         logger.info(f"All eval results saved to {all_eval_results_path}")
-
+    
     # Write model card and (optionally) push to hub
     config_name = data_args.dataset_config_name if data_args.dataset_config_name is not None else "na"
     kwargs = {

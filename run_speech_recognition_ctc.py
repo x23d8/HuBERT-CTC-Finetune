@@ -49,6 +49,7 @@ from transformers import (
     AutoTokenizer,
     HfArgumentParser,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
     set_seed,
 )
@@ -773,6 +774,9 @@ def main():
         pred_ids = torch.argmax(logits, dim=-1)
         return pred_ids, labels
 
+    # Store latest predictions for saving to JSON
+    _latest_predictions = {"pred_str": [], "label_str": []}
+
     def compute_metrics(pred):
         pred_ids = pred.predictions[0]
         pred.label_ids[pred.label_ids == -100] = tokenizer.pad_token_id
@@ -781,9 +785,50 @@ def main():
         # we do not want to group tokens when computing the metrics
         label_str = tokenizer.batch_decode(pred.label_ids, group_tokens=False)
 
+        # Log each prediction vs ground truth
+        logger.info("=" * 60)
+        logger.info("EVALUATION PREDICTIONS vs GROUND TRUTH")
+        logger.info("=" * 60)
+        for i, (pred_text, label_text) in enumerate(zip(pred_str, label_str)):
+            logger.info(f"[Sample {i+1}]")
+            logger.info(f"  PRED: {pred_text}")
+            logger.info(f"  TRUE: {label_text}")
+        logger.info("=" * 60)
+
+        # Save predictions for JSON export
+        _latest_predictions["pred_str"] = list(pred_str)
+        _latest_predictions["label_str"] = list(label_str)
+
         metrics = {k: v.compute(predictions=pred_str, references=label_str) for k, v in eval_metrics.items()}
 
         return metrics
+
+    # Custom callback to log eval results per epoch and accumulate them
+    class EvalLoggingCallback(TrainerCallback):
+        def __init__(self):
+            self.all_eval_results = []
+
+        def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+            if metrics is not None:
+                epoch = state.epoch if state.epoch is not None else state.global_step
+                # Build per-sample predictions list
+                samples = []
+                for p, t in zip(_latest_predictions.get("pred_str", []), _latest_predictions.get("label_str", [])):
+                    samples.append({"prediction": p, "ground_truth": t})
+                result_entry = {
+                    "epoch": epoch,
+                    "global_step": state.global_step,
+                    **metrics,
+                    "samples": samples,
+                }
+                self.all_eval_results.append(result_entry)
+                logger.info("=" * 60)
+                logger.info(f"EVAL RESULTS — Epoch {epoch}, Step {state.global_step}")
+                for k, v in metrics.items():
+                    logger.info(f"  {k}: {v}")
+                logger.info("=" * 60)
+
+    eval_logging_callback = EvalLoggingCallback()
 
     # Now save everything to be able to create a single processor later
     # make sure all processes wait until data is saved
@@ -812,6 +857,7 @@ def main():
         eval_dataset=vectorized_datasets["eval"] if training_args.do_eval else None,
         processing_class=processor,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        callbacks=[eval_logging_callback],
     )
 
     # 8. Finally, we can start training
@@ -851,6 +897,13 @@ def main():
 
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
+
+    # Save all accumulated eval results to JSON
+    if eval_logging_callback.all_eval_results:
+        all_eval_results_path = os.path.join(training_args.output_dir, "all_eval_results.json")
+        with open(all_eval_results_path, "w") as f:
+            json.dump(eval_logging_callback.all_eval_results, f, indent=2)
+        logger.info(f"All eval results saved to {all_eval_results_path}")
 
     # Write model card and (optionally) push to hub
     config_name = data_args.dataset_config_name if data_args.dataset_config_name is not None else "na"

@@ -539,7 +539,8 @@ def main():
             )
 
         if data_args.max_train_samples is not None:
-            raw_datasets["train"] = raw_datasets["train"].select(range(data_args.max_train_samples))
+            max_train_samples = min(data_args.max_train_samples, len(raw_datasets["train"]))
+            raw_datasets["train"] = raw_datasets["train"].select(range(max_train_samples))
 
     if training_args.do_eval:
         raw_datasets["eval"] = load_dataset(
@@ -551,7 +552,8 @@ def main():
         )
 
         if data_args.max_eval_samples is not None:
-            raw_datasets["eval"] = raw_datasets["eval"].select(range(data_args.max_eval_samples))
+            max_eval_samples = min(data_args.max_eval_samples, len(raw_datasets["eval"]))
+            raw_datasets["eval"] = raw_datasets["eval"].select(range(max_eval_samples))
 
     # 2. We remove some special characters from the datasets
     # that make training complicated and do not help in transcribing the speech
@@ -805,7 +807,6 @@ def main():
         model=model,
         data_collator=data_collator,
         args=training_args,
-        push_to_hub = False,
         compute_metrics=compute_metrics,
         train_dataset=vectorized_datasets["train"] if training_args.do_train else None,
         eval_dataset=vectorized_datasets["eval"] if training_args.do_eval else None,

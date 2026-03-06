@@ -37,8 +37,10 @@ from dataclasses import dataclass, field
 
 import datasets
 import evaluate
+import numpy as np
 import torch
-from datasets import DatasetDict, load_dataset
+import torch.nn as nn
+from datasets import DatasetDict, load_dataset, load_from_disk
 
 import transformers
 from transformers import (
@@ -173,8 +175,9 @@ class DataTrainingArguments:
     the command line.
     """
 
-    dataset_name: str = field(
-        metadata={"help": "Path or name of the dataset (cf `load_dataset` method of the Datasets library)."}
+    dataset_name: str | None = field(
+        default=None,
+        metadata={"help": "Path or name of the dataset (cf `load_dataset` method of the Datasets library). Not required when using --use_preextracted_features."}
     )
     dataset_config_name: str = field(
         default=None,
@@ -305,6 +308,25 @@ class DataTrainingArguments:
             )
         },
     )
+    use_preextracted_features: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to use pre-extracted encoder hidden states instead of raw audio. "
+                "When set, the script will load an Arrow dataset with pre-computed features "
+                "and only fine-tune the CTC head (lm_head)."
+            )
+        },
+    )
+    features_dataset_path: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to an Arrow dataset saved by extract_feature.py --save_arrow. "
+                "Required when use_preextracted_features is True."
+            )
+        },
+    )
 
 
 @dataclass
@@ -369,6 +391,115 @@ class DataCollatorCTCWithPadding:
             batch["attention_mask"] = batch["attention_mask"].to(torch.long)
 
         return batch
+
+
+# ---------------------------------------------------------------------------
+# CTC head-only model wrapper — for pre-extracted features
+# ---------------------------------------------------------------------------
+
+class CTCHeadOnlyModel(nn.Module):
+    """
+    Lightweight wrapper that takes pre-extracted encoder hidden states
+    and only runs  dropout → lm_head → CTC loss.
+
+    Compatible with HuggingFace Trainer (returns dict with 'loss' and 'logits').
+    """
+
+    def __init__(self, ctc_model):
+        super().__init__()
+        # Extract only the parts we need from the full CTC model
+        self.dropout = ctc_model.dropout if hasattr(ctc_model, "dropout") else nn.Identity()
+        self.lm_head = ctc_model.lm_head
+        self.config = ctc_model.config
+
+    def forward(self, hidden_states, labels=None, attention_mask=None, **kwargs):
+        hidden = self.dropout(hidden_states)
+        logits = self.lm_head(hidden)
+
+        loss = None
+        if labels is not None:
+            # CTC loss
+            log_probs = nn.functional.log_softmax(logits, dim=-1).transpose(0, 1)
+
+            # input_lengths from attention_mask or full length
+            if attention_mask is not None:
+                input_lengths = attention_mask.sum(dim=-1).long()
+            else:
+                input_lengths = torch.full(
+                    (logits.shape[0],), logits.shape[1], dtype=torch.long, device=logits.device
+                )
+
+            # target_lengths: count non-padding tokens (not -100)
+            target_lengths = (labels != -100).sum(dim=-1).long()
+
+            # Replace -100 with pad_token_id for CTC loss computation
+            labels_for_ctc = labels.clone()
+            labels_for_ctc[labels_for_ctc == -100] = 0
+
+            ctc_loss = nn.CTCLoss(
+                blank=self.config.pad_token_id,
+                reduction=getattr(self.config, "ctc_loss_reduction", "mean"),
+                zero_infinity=getattr(self.config, "ctc_zero_infinity", False),
+            )
+            loss = ctc_loss(log_probs, labels_for_ctc, input_lengths, target_lengths)
+
+        return {"loss": loss, "logits": logits}
+
+
+@dataclass
+class DataCollatorPreextracted:
+    """
+    Data collator for pre-extracted hidden states.
+    Pads hidden_states (2D: seq_len × hidden_dim) and labels.
+    """
+
+    pad_token_id: int = 0
+    hidden_dim: int = 1024
+
+    def __call__(self, features: list[dict]) -> dict[str, torch.Tensor]:
+        # Reconstruct hidden_states tensors from flattened lists
+        hidden_states_list = []
+        for f in features:
+            shape = f["hidden_states_shape"]
+            hs = torch.tensor(f["hidden_states"], dtype=torch.float32).reshape(shape[0], shape[1])
+            hidden_states_list.append(hs)
+
+        # Pad hidden_states to max seq_len
+        max_len = max(hs.shape[0] for hs in hidden_states_list)
+        padded_hs = []
+        attention_masks = []
+        for hs in hidden_states_list:
+            seq_len = hs.shape[0]
+            pad_len = max_len - seq_len
+            if pad_len > 0:
+                padded = torch.cat([hs, torch.zeros(pad_len, hs.shape[1])], dim=0)
+            else:
+                padded = hs
+            padded_hs.append(padded)
+            mask = torch.cat([torch.ones(seq_len), torch.zeros(pad_len)])
+            attention_masks.append(mask)
+
+        batch_hs = torch.stack(padded_hs)        # (batch, max_len, hidden_dim)
+        batch_mask = torch.stack(attention_masks).long()  # (batch, max_len)
+
+        # Pad labels
+        label_list = [torch.tensor(f["labels"], dtype=torch.long) for f in features]
+        max_label_len = max(l.shape[0] for l in label_list)
+        padded_labels = []
+        for l in label_list:
+            pad_len = max_label_len - l.shape[0]
+            if pad_len > 0:
+                padded = torch.cat([l, torch.full((pad_len,), -100, dtype=torch.long)])
+            else:
+                padded = l
+            padded_labels.append(padded)
+        batch_labels = torch.stack(padded_labels)  # (batch, max_label_len)
+
+        return {
+            "hidden_states": batch_hs,
+            "attention_mask": batch_mask,
+            "labels": batch_labels,
+        }
 
 
 def create_vocabulary_from_data(
@@ -447,6 +578,292 @@ def main():
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
+
+    # =====================================================================
+    # PRE-EXTRACTED FEATURES BRANCH (early exit)
+    # When use_preextracted_features is True, we skip dataset loading
+    # entirely and load the Arrow dataset from features_dataset_path.
+    # =====================================================================
+    if data_args.use_preextracted_features:
+        if data_args.features_dataset_path is None:
+            raise ValueError(
+                "--features_dataset_path must be set when --use_preextracted_features is True."
+            )
+
+        logger.info("=" * 60)
+        logger.info("USING PRE-EXTRACTED FEATURES MODE")
+        logger.info(f"Loading features from: {data_args.features_dataset_path}")
+        logger.info("Only the CTC head (lm_head + dropout) will be trained.")
+        logger.info("=" * 60)
+
+        # Load config
+        config = AutoConfig.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            token=data_args.token,
+            trust_remote_code=data_args.trust_remote_code,
+        )
+
+        # Load feature extractor (needed for saving processor later)
+        feature_extractor = AutoFeatureExtractor.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            token=data_args.token,
+            trust_remote_code=data_args.trust_remote_code,
+        )
+
+        # Load Arrow dataset
+        features_ds = load_from_disk(data_args.features_dataset_path)
+        logger.info(f"Loaded dataset splits: {list(features_ds.keys())}")
+        for split_name, ds in features_ds.items():
+            logger.info(f"  {split_name}: {len(ds)} samples, columns: {ds.column_names}")
+
+        # Text preprocessing: lowercasing + remove special chars
+        chars_to_ignore_regex = (
+            f"[{''.join(data_args.chars_to_ignore)}]" if data_args.chars_to_ignore is not None else None
+        )
+
+        def preprocess_text(batch):
+            text = batch["text"]
+            if chars_to_ignore_regex is not None:
+                text = re.sub(chars_to_ignore_regex, "", text)
+            batch["target_text"] = text.lower() + " "
+            return batch
+
+        features_ds = features_ds.map(preprocess_text, desc="preprocess text", load_from_cache_file=False)
+
+        # Build vocabulary
+        word_delimiter_token = data_args.word_delimiter_token
+        unk_token = data_args.unk_token
+        pad_token = data_args.pad_token
+        tokenizer_name_or_path_feat = model_args.tokenizer_name_or_path
+        tokenizer_kwargs_feat = {}
+
+        if tokenizer_name_or_path_feat is None:
+            tokenizer_name_or_path_feat = training_args.output_dir
+            vocab_file = os.path.join(tokenizer_name_or_path_feat, "vocab.json")
+            with training_args.main_process_first():
+                if os.path.isfile(vocab_file):
+                    try:
+                        os.remove(vocab_file)
+                    except OSError:
+                        pass
+            with training_args.main_process_first(desc="vocabulary creation"):
+                if not os.path.isfile(vocab_file):
+                    os.makedirs(tokenizer_name_or_path_feat, exist_ok=True)
+                    vocab_dict = create_vocabulary_from_data(
+                        features_ds,
+                        word_delimiter_token=word_delimiter_token,
+                        unk_token=unk_token,
+                        pad_token=pad_token,
+                    )
+                    with open(vocab_file, "w") as file:
+                        json.dump(vocab_dict, file)
+            tokenizer_kwargs_feat = {
+                "config": config,
+                "tokenizer_type": config.model_type,
+                "unk_token": unk_token,
+                "pad_token": pad_token,
+                "word_delimiter_token": word_delimiter_token,
+            }
+
+        tokenizer_feat = AutoTokenizer.from_pretrained(
+            tokenizer_name_or_path_feat,
+            token=data_args.token,
+            trust_remote_code=data_args.trust_remote_code,
+            **tokenizer_kwargs_feat,
+        )
+
+        # Adapt config and create model
+        config.update({
+            "feat_proj_dropout": model_args.feat_proj_dropout,
+            "attention_dropout": model_args.attention_dropout,
+            "hidden_dropout": model_args.hidden_dropout,
+            "final_dropout": model_args.final_dropout,
+            "mask_time_prob": model_args.mask_time_prob,
+            "mask_time_length": model_args.mask_time_length,
+            "mask_feature_prob": model_args.mask_feature_prob,
+            "mask_feature_length": model_args.mask_feature_length,
+            "gradient_checkpointing": training_args.gradient_checkpointing,
+            "layerdrop": model_args.layerdrop,
+            "ctc_loss_reduction": model_args.ctc_loss_reduction,
+            "ctc_zero_infinity": model_args.ctc_zero_infinity,
+            "pad_token_id": tokenizer_feat.pad_token_id,
+            "vocab_size": len(tokenizer_feat),
+            "activation_dropout": model_args.activation_dropout,
+            "add_adapter": model_args.add_adapter,
+        })
+
+        model = AutoModelForCTC.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            config=config,
+            token=data_args.token,
+            trust_remote_code=data_args.trust_remote_code,
+            ignore_mismatched_sizes=True,
+        )
+
+        # Rebuild lm_head if vocab size changed
+        if model.lm_head.out_features != len(tokenizer_feat):
+            logger.info(
+                f"Rebuilding lm_head: {model.lm_head.out_features} → {len(tokenizer_feat)} classes"
+            )
+            model.lm_head = nn.Linear(config.hidden_size, len(tokenizer_feat))
+
+        # Tokenize target text
+        phoneme_language = data_args.phoneme_language
+
+        def tokenize_targets(batch):
+            additional_kwargs = {}
+            if phoneme_language is not None:
+                additional_kwargs["phonemizer_lang"] = phoneme_language
+            batch["labels"] = tokenizer_feat(batch["target_text"], **additional_kwargs).input_ids
+            return batch
+
+        features_ds = features_ds.map(tokenize_targets, desc="tokenize targets", load_from_cache_file=False)
+
+        # Limit samples
+        if data_args.max_train_samples is not None and "train" in features_ds:
+            n = min(data_args.max_train_samples, len(features_ds["train"]))
+            features_ds["train"] = features_ds["train"].select(range(n))
+        if data_args.max_eval_samples is not None and "eval" in features_ds:
+            n = min(data_args.max_eval_samples, len(features_ds["eval"]))
+            features_ds["eval"] = features_ds["eval"].select(range(n))
+
+        # Get hidden_dim from first sample
+        first_shape = features_ds["train"][0]["hidden_states_shape"]
+        hidden_dim = first_shape[1]
+        logger.info(f"Hidden dimension: {hidden_dim}")
+
+        # Create CTC head-only model
+        head_model = CTCHeadOnlyModel(model)
+        head_model.to(training_args.device)
+
+        # Data collator
+        data_collator_feat = DataCollatorPreextracted(
+            pad_token_id=tokenizer_feat.pad_token_id,
+            hidden_dim=hidden_dim,
+        )
+
+        # Metrics
+        eval_metrics_feat = {
+            metric: evaluate.load(metric, cache_dir=model_args.cache_dir)
+            for metric in data_args.eval_metrics
+        }
+
+        def preprocess_logits_feat(logits, labels):
+            pred_ids = torch.argmax(logits, dim=-1)
+            return pred_ids, labels
+
+        _latest_predictions_feat = {"pred_str": [], "label_str": []}
+
+        def compute_metrics_feat(pred):
+            pred_ids = pred.predictions[0]
+            pred.label_ids[pred.label_ids == -100] = tokenizer_feat.pad_token_id
+            pred_str = tokenizer_feat.batch_decode(pred_ids)
+            label_str = tokenizer_feat.batch_decode(pred.label_ids, group_tokens=False)
+
+            logger.info("=" * 60)
+            logger.info("EVALUATION PREDICTIONS vs GROUND TRUTH")
+            logger.info("=" * 60)
+            for i, (p, t) in enumerate(zip(pred_str, label_str)):
+                logger.info(f"[Sample {i+1}]  PRED: {p}")
+                logger.info(f"              TRUE: {t}")
+            logger.info("=" * 60)
+
+            _latest_predictions_feat["pred_str"] = list(pred_str)
+            _latest_predictions_feat["label_str"] = list(label_str)
+
+            metrics = {
+                k: v.compute(predictions=pred_str, references=label_str)
+                for k, v in eval_metrics_feat.items()
+            }
+            return metrics
+
+        class EvalLoggingCallbackFeat(TrainerCallback):
+            def __init__(self):
+                self.all_eval_results = []
+
+            def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+                if metrics is not None:
+                    epoch = state.epoch if state.epoch is not None else state.global_step
+                    samples = []
+                    for p, t in zip(
+                        _latest_predictions_feat.get("pred_str", []),
+                        _latest_predictions_feat.get("label_str", []),
+                    ):
+                        samples.append({"prediction": p, "ground_truth": t})
+                    result_entry = {
+                        "epoch": epoch,
+                        "global_step": state.global_step,
+                        **metrics,
+                        "samples": samples,
+                    }
+                    self.all_eval_results.append(result_entry)
+                    logger.info(f"EVAL — Epoch {epoch}, Step {state.global_step}")
+                    for k, v in metrics.items():
+                        logger.info(f"  {k}: {v}")
+
+        eval_cb_feat = EvalLoggingCallbackFeat()
+
+        # Save tokenizer / config
+        with training_args.main_process_first():
+            if is_main_process(training_args.local_process_index):
+                feature_extractor.save_pretrained(training_args.output_dir)
+                tokenizer_feat.save_pretrained(training_args.output_dir)
+                config.save_pretrained(training_args.output_dir)
+
+        # Disable auto-removal of unused columns — the DataCollator needs
+        # hidden_states_shape which isn't in the model's forward() signature.
+        training_args.remove_unused_columns = False
+
+        # Trainer
+        trainer_feat = Trainer(
+            model=head_model,
+            data_collator=data_collator_feat,
+            args=training_args,
+            compute_metrics=compute_metrics_feat,
+            train_dataset=features_ds.get("train"),
+            eval_dataset=features_ds.get("eval"),
+            preprocess_logits_for_metrics=preprocess_logits_feat,
+            callbacks=[eval_cb_feat],
+        )
+
+        # Train
+        if training_args.do_train:
+            train_result = trainer_feat.train()
+            trainer_feat.save_model()
+            metrics = train_result.metrics
+            metrics["train_samples"] = len(features_ds["train"])
+            trainer_feat.log_metrics("train", metrics)
+            trainer_feat.save_metrics("train", metrics)
+            trainer_feat.save_state()
+
+        # Eval
+        if training_args.do_eval and "eval" in features_ds:
+            logger.info("*** Evaluate (pre-extracted features) ***")
+            metrics = trainer_feat.evaluate()
+            metrics["eval_samples"] = len(features_ds["eval"])
+            trainer_feat.log_metrics("eval", metrics)
+            trainer_feat.save_metrics("eval", metrics)
+
+        # Save eval results JSON
+        if eval_cb_feat.all_eval_results:
+            path = os.path.join(training_args.output_dir, "all_eval_results.json")
+            with open(path, "w") as f:
+                json.dump(eval_cb_feat.all_eval_results, f, indent=2)
+            logger.info(f"All eval results saved to {path}")
+
+        logger.info("Done! (pre-extracted features mode)")
+        return {}
+
+    # =====================================================================
+    # STANDARD AUDIO PIPELINE (requires dataset_name)
+    # =====================================================================
+    if data_args.dataset_name is None:
+        raise ValueError(
+            "--dataset_name is required when not using --use_preextracted_features."
+        )
 
     # 1. First, let's load the dataset
     raw_datasets = DatasetDict()
